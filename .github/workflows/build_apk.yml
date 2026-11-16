@@ -38,6 +38,7 @@ jobs:
 
       - name: Build APK
         run: |
+          find . -maxdepth 3 -name "main.py" -exec cp {} ./main.py \; 2>/dev/null || true
           pip install flet==0.25.2
           printf "telethon==1.37.0\n" > requirements.txt
           flet build apk --project "MonitorPromocoes" --org "com.arthur.monitor" --verbose
