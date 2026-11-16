@@ -143,29 +143,42 @@ async def main(page: ft.Page):
 
             if cmd in ("/ajuda", "/help"):
                 await event.reply(
-                    "🤖 **Comandos do Monitor:**\n"
-                    "`/add Nome | palavra1, palavra2 | alt1, alt2`\n"
-                    "`/del Nome` — remove uma regra\n"
-                    "`/lista` — lista regras ativas\n"
-                    "`/status` — mostra status e alertas"
+                    "🤖 **Comandos do Monitor de Promoções**\n\n"
+                    "• `/regras` — Lista regras ativas\n"
+                    "• `/add Nome | obrig1, obrig2 | alt1, alt2` — Adiciona/edita regra\n"
+                    "• `/del Nome` — Remove uma regra\n"
+                    "• `/grupos` — Mostra grupos filtrados\n"
+                    "• `/meusgrupos` — Lista seus grupos/canais e IDs\n"
+                    "• `/addgrupo id_ou_user` — Filtra um grupo específico\n"
+                    "• `/delgrupo id_ou_user` — Remove grupo do filtro\n"
+                    "• `/limpargrupos` — Volta a monitorar TODOS os grupos\n"
+                    "• `/testar frase` — Testa uma frase nas regras\n"
+                    "• `/status` — Verifica se o monitor está rodando"
                 )
+
             elif cmd == "/status":
                 await event.reply(
-                    f"✅ Monitor ativo!\n"
-                    f"Regras: {len(cfg['regras'])}\n"
-                    f"Grupos filtrados: {len(cfg['grupos']) or 'Todos'}\n"
-                    f"Alertas na sessão: {alertas_enviados}"
+                    f"✅ **Monitor de Promoções ativo!**\n"
+                    f"• Regras ativas: {len(cfg['regras'])}\n"
+                    f"• Grupos filtrados: {len(cfg['grupos']) if cfg['grupos'] else 'Todos'}\n"
+                    f"• Alertas enviados nesta sessão: {alertas_enviados}"
                 )
-            elif cmd == "/lista":
+
+            elif cmd in ("/regras", "/lista"):
                 if not cfg["regras"]:
                     await event.reply("Nenhuma regra cadastrada.")
                 else:
-                    linhas = [f"• **{r['name']}**: {', '.join(r['all'])}" for r in cfg["regras"]]
+                    linhas = []
+                    for r in cfg["regras"]:
+                        obrig = ", ".join(r["all"])
+                        alts = f" | alt: {', '.join(r['any_groups'][0])}" if r.get("any_groups") else ""
+                        linhas.append(f"• **{r['name']}**: {obrig}{alts}")
                     await event.reply("📋 **Regras ativas:**\n" + "\n".join(linhas))
+
             elif cmd == "/add":
                 blocos = [b.strip() for b in arg.split("|")]
                 if len(blocos) < 2 or not blocos[0] or not blocos[1]:
-                    await event.reply("Uso: `/add Nome | palavra1, palavra2 | opcional1, opcional2`")
+                    await event.reply("Uso: `/add Nome | obrig1, obrig2 | alt1, alt2`")
                     return
                 nome = blocos[0]
                 obrig = [t.strip() for t in blocos[1].split(",") if t.strip()]
@@ -174,8 +187,12 @@ async def main(page: ft.Page):
                 cfg["regras"].append({"name": nome, "all": obrig, "any_groups": alts})
                 salvar_config(cfg)
                 renderizar_regras()
-                await event.reply(f"✅ Regra **{nome}** adicionada!")
+                await event.reply(f"✅ Regra **{nome}** adicionada/atualizada!")
+
             elif cmd == "/del":
+                if not arg:
+                    await event.reply("Uso: `/del Nome`")
+                    return
                 antes = len(cfg["regras"])
                 cfg["regras"] = [r for r in cfg["regras"] if r["name"].lower() != arg.lower()]
                 salvar_config(cfg)
@@ -184,6 +201,74 @@ async def main(page: ft.Page):
                     await event.reply(f"🗑️ Regra **{arg}** removida.")
                 else:
                     await event.reply(f"Regra **{arg}** não encontrada.")
+
+            elif cmd == "/grupos":
+                if not cfg["grupos"]:
+                    await event.reply("🌐 Monitorando **TODOS** os grupos e canais.")
+                else:
+                    lista = "\n".join(f"• `{g}`" for g in cfg["grupos"])
+                    await event.reply(f"📌 **Grupos filtrados ({len(cfg['grupos'])}):**\n{lista}")
+
+            elif cmd == "/meusgrupos":
+                linhas = []
+                async for d in tg_client.iter_dialogs():
+                    if d.is_group or d.is_channel:
+                        pid = utils.get_peer_id(d.id)
+                        user = f" (@{d.entity.username})" if getattr(d.entity, "username", None) else ""
+                        linhas.append(f"• **{d.name}**{user} → `{pid}`")
+                if not linhas:
+                    await event.reply("Nenhum grupo ou canal encontrado.")
+                else:
+                    bloco = "\n".join(linhas[:50])
+                    await event.reply(f"📂 **Seus grupos/canais:**\n{bloco}")
+
+            elif cmd == "/addgrupo":
+                if not arg:
+                    await event.reply("Uso: `/addgrupo id_ou_user`")
+                    return
+                try:
+                    entidade = await tg_client.get_entity(int(arg) if arg.lstrip("-").isdigit() else arg)
+                    pid = utils.get_peer_id(entidade)
+                    if pid not in cfg["grupos"]:
+                        cfg["grupos"].append(pid)
+                        salvar_config(cfg)
+                    nome_ent = getattr(entidade, "title", None) or getattr(entidade, "username", str(pid))
+                    await event.reply(f"✅ Grupo **{nome_ent}** (`{pid}`) adicionado ao filtro.")
+                except Exception as ex:
+                    await event.reply(f"❌ Não encontrei o grupo `{arg}`: {ex}")
+
+            elif cmd == "/delgrupo":
+                if not arg:
+                    await event.reply("Uso: `/delgrupo id_ou_user`")
+                    return
+                try:
+                    entidade = await tg_client.get_entity(int(arg) if arg.lstrip("-").isdigit() else arg)
+                    pid = utils.get_peer_id(entidade)
+                    alvo_ids = {pid, getattr(entidade, "id", pid)}
+                except Exception:
+                    alvo_ids = {int(arg)} if arg.lstrip("-").isdigit() else set()
+                antes = len(cfg["grupos"])
+                cfg["grupos"] = [g for g in cfg["grupos"] if g not in alvo_ids]
+                salvar_config(cfg)
+                if len(cfg["grupos"]) < antes:
+                    await event.reply(f"🗑️ Grupo `{arg}` removido do filtro.")
+                else:
+                    await event.reply(f"Grupo `{arg}` não estava na lista de filtro.")
+
+            elif cmd == "/limpargrupos":
+                cfg["grupos"] = []
+                salvar_config(cfg)
+                await event.reply("🌐 Filtro limpo! Voltando a monitorar **TODOS** os grupos.")
+
+            elif cmd == "/testar":
+                if not arg:
+                    await event.reply("Uso: `/testar frase de exemplo`")
+                    return
+                batidas = checar_regras(arg, cfg["regras"])
+                if batidas:
+                    await event.reply(f"🎯 **Bateu nas regras:** {', '.join(batidas)}")
+                else:
+                    await event.reply("❌ Nenhuma regra bateu com essa frase.")
 
         @tg_client.on(events.NewMessage())
         async def handler_grupos(event):
@@ -504,4 +589,3 @@ async def main(page: ft.Page):
 
 
 ft.app(target=main)
-                          
