@@ -28,9 +28,13 @@ jobs:
           flutter-version: "3.24.3"
           channel: "stable"
 
+      - name: Accept Android Licenses
+        run: yes | flutter doctor --android-licenses || true
+
       - name: Install dependencies and Build APK
         run: |
-          pip install flet==0.24.1 telethon==1.37.0
+          printf "flet==0.24.1\ntelethon==1.37.0\n" > requirements.txt
+          pip install -r requirements.txt
           flet build apk --project "MonitorPromocoes" --org "com.arthur.monitor"
 
       - name: Upload APK
