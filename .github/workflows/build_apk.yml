@@ -33,6 +33,7 @@ jobs:
 
       - name: Install dependencies and Build APK
         run: |
+          cp .github/workflows/main.py . 2>/dev/null || true
           printf "flet==0.24.1\ntelethon==1.37.0\n" > requirements.txt
           pip install -r requirements.txt
           flet build apk --project "MonitorPromocoes" --org "com.arthur.monitor"
