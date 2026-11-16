@@ -36,14 +36,25 @@ jobs:
       - name: Accept Android Licenses
         run: yes | flutter doctor --android-licenses || true
 
+      - name: Gerar wheel do pyaes (só tem sdist no PyPI)
+        run: |
+          pip install wheel setuptools
+          mkdir -p wheels
+          pip wheel pyaes -w wheels
+          ls wheels
+
+      - name: Diagnóstico (mostra quem conflita sem o wheel)
+        run: |
+          printf "flet==0.25.2\ntelethon\n" > /tmp/req.txt
+          pip install --dry-run --only-binary=:all: -r /tmp/req.txt || true
+
       - name: Build APK
+        env:
+          PIP_FIND_LINKS: ${{ github.workspace }}/wheels
         run: |
           find . -maxdepth 3 -name "main.py" -exec cp {} ./main.py \; 2>/dev/null || true
           pip install flet==0.25.2
-          cat << 'EOF' > requirements.txt
-          flet==0.25.2
-          telethon
-          EOF
+          printf "flet==0.25.2\ntelethon\n" > requirements.txt
           flet build apk --project "MonitorPromocoes" --org "com.arthur.monitor" --verbose
 
       - name: Upload APK
