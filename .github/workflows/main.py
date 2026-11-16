@@ -5,6 +5,7 @@ import asyncio
 import traceback
 import flet as ft
 from telethon import TelegramClient, events, utils
+from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
 DEFAULT_API_ID = ""
@@ -13,7 +14,6 @@ DEFAULT_API_HASH = ""
 STORAGE_DIR = os.getenv("FLET_APP_STORAGE_DATA") or os.path.expanduser("~")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(STORAGE_DIR, "config_monitor.json")
-SESSION_FILE = os.path.join(STORAGE_DIR, "sessao_usuario")
 
 # ============ LÓGICA DE REGRAS ============
 
@@ -55,6 +55,7 @@ def carregar_config() -> dict:
         "api_id": DEFAULT_API_ID,
         "api_hash": DEFAULT_API_HASH,
         "telefone": "+55",
+        "session_string": "",
         "grupos": [],
         "regras": [],
     }
@@ -70,7 +71,7 @@ def salvar_config(cfg: dict):
 async def main(page: ft.Page):
     page.title = "Monitor de Promoções"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.padding = 16
+    page.padding = ft.padding.only(top=36, left=16, right=16, bottom=16)
     page.scroll = ft.ScrollMode.AUTO
 
     cfg = carregar_config()
@@ -130,8 +131,6 @@ async def main(page: ft.Page):
     # --- COMANDOS VIA MENSAGENS SALVAS + ESCUTA DE GRUPOS ---
     async def iniciar_escuta(tg_client: TelegramClient):
         nonlocal monitorando, alertas_enviados, listen_task
-
-        tg_client.remove_event_handlers()
 
         @tg_client.on(events.NewMessage(chats="me"))
         async def comando_mensagens_salvas(event):
@@ -240,17 +239,30 @@ async def main(page: ft.Page):
             avisar("Preencha API ID, API HASH e seu telefone com +55.", ft.colors.RED_700)
             return
 
+        btn_ligar.disabled = True
+        btn_ligar.text = "Conectando..."
+        page.update()
+
         cfg["api_id"] = int(api_id_str)
         cfg["api_hash"] = api_hash
         cfg["telefone"] = tel
         salvar_config(cfg)
 
         try:
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
             loop = asyncio.get_running_loop()
-            client = TelegramClient(SESSION_FILE, cfg["api_id"], cfg["api_hash"], loop=loop)
+            sessao = StringSession(cfg.get("session_string", ""))
+            client = TelegramClient(sessao, cfg["api_id"], cfg["api_hash"], loop=loop)
             await client.connect()
 
             if await client.is_user_authorized():
+                cfg["session_string"] = client.session.save()
+                salvar_config(cfg)
                 await iniciar_escuta(client)
             else:
                 sent = await client.send_code_request(tel)
@@ -262,14 +274,19 @@ async def main(page: ft.Page):
                 avisar("Digite o código que chegou no seu Telegram!")
         except Exception as ex:
             txt_erro_detalhe.value = traceback.format_exc()
-            page.update()
             avisar(f"Erro ao conectar: {ex}", ft.colors.RED_700)
+        finally:
+            btn_ligar.disabled = False
+            btn_ligar.text = "▶️ Ligar Monitor"
+            page.update()
 
     async def on_confirmar_codigo_click(e):
         codigo = inp_codigo.value.strip()
         senha = inp_senha_2fa.value.strip()
         if not codigo or not client:
             return
+        btn_confirmar_codigo.disabled = True
+        page.update()
         try:
             try:
                 await client.sign_in(cfg["telefone"], codigo, phone_code_hash=phone_code_hash)
@@ -281,11 +298,15 @@ async def main(page: ft.Page):
                     return
                 await client.sign_in(password=senha)
 
+            cfg["session_string"] = client.session.save()
+            salvar_config(cfg)
             await iniciar_escuta(client)
         except Exception as ex:
             txt_erro_detalhe.value = traceback.format_exc()
-            page.update()
             avisar(f"Código ou senha inválidos: {ex}", ft.colors.RED_700)
+        finally:
+            btn_confirmar_codigo.disabled = False
+            page.update()
 
     async def on_desligar_click(e):
         nonlocal monitorando, listen_task
@@ -483,3 +504,4 @@ async def main(page: ft.Page):
 
 
 ft.app(target=main)
+                          
