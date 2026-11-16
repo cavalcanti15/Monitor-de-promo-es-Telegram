@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -31,16 +31,14 @@ jobs:
       - name: Accept Android Licenses
         run: yes | flutter doctor --android-licenses || true
 
-      - name: Prepare Clean Build Folder and Build APK
+      - name: Build APK
         run: |
           pip install flet==0.24.1
-          mkdir -p app_src
-          cp main.py app_src/main.py 2>/dev/null || cp .github/workflows/main.py app_src/main.py
-          printf "telethon==1.37.0\n" > app_src/requirements.txt
-          flet build apk app_src --project "MonitorPromocoes" --org "com.arthur.monitor" --verbose
+          printf "telethon==1.37.0\n" > requirements.txt
+          flet build apk --project "MonitorPromocoes" --org "com.arthur.monitor" --verbose
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: MonitorPromocoes-APK
-          path: app_src/build/apk/app-release.apk
+          path: build/apk/app-release.apk
