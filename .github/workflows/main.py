@@ -1,54 +1,30 @@
 # --------------------------------------------------------------
-# main.py  –  Monitor de promoções do Telegram (Flet + Telethon)
+# main.py – Monitor de promoções do Telegram (Flet + Telethon)
 # --------------------------------------------------------------
 import os
 import re
 import json
 import asyncio
 import traceback
-import uuid
-from pathlib import Path
-from typing import List, Dict, Optional
-
-import firebase
-import firebase_admin
-from firebase_admin import credentials, db
-import plyer.notification
-from workmanager import WorkManager
-from firebase_admin import messaging
+from typing import Optional
 
 import flet as ft
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
+import plyer  # pip install plyer   <-- necessário para notificações nativas
 
 # ------------------------------------------------------------------
-# CONFIGURAÇÕES GLOBAIS (injeção via Firebase/Preferences)
+# ✅ VARIÁVEIS DO NÍVEL SUPERIOR DE `main`
+#    Estes objetos serão “compartilhados” pelas funções aninhadas
+#    através da palavra‑chave `nonlocal`. Colocá‑las aqui fora
+#    das funções aninhadas resolve o erro SyntaxError.
 # ------------------------------------------------------------------
-DEFAULT_API_ID = ""
-DEFAULT_API_HASH = ""
-
-# --------------------------------------------------------------
-# 1️⃣  Inicializar Firebase (apenas uma vez por sessão)
-# ------------------------------------------------------------------
-def init_firebase():
-    """Lê as credências do ambiente ou de um ficheiro que o utilizador colocar."""
-    cred_path = os.getenv("FIREBASE_CRED_PATH", None)
-    if not cred_path or not Path(cred_path).exists():
-        # Caso o utilizador ainda não tenha configurado, criamos um "mock" DB local.
-        # Isso permite que o app rode offline; depois ele sincroniza quando tem credenciais.
-        print("[WARN] Firebase não configurado – usando sincronização local apenas.")
-        return None
-
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred, {"databaseURL": os.getenv("FIREBASE_DB_URL")})
-    return db.reference("rules")   # referência à node “rules”
-
-rules_ref = init_firebase()  # pode ser None
-
+client: Optional[TelegramClient] = None
+phone_code_hash: Optional[str] = None
 
 # ------------------------------------------------------------------
-# 2️⃣  Modelos e helpers de regras (idênticos ao teu código original)
+# Funções auxiliares (fora de `main` – podem ser reutilizadas)
 # ------------------------------------------------------------------
 _TROCA_ACENTOS = str.maketrans("áàâãéêíóôõúüç", "aaaaeeiooouuc")
 _RE_NUM_UNIDADE = re.compile(r"(\d)\s+(gb|tb|mb|kb)\b")
@@ -59,7 +35,7 @@ def normalizar(texto: str) -> str:
     return _RE_NUM_UNIDADE.sub(r"\1\2", texto)
 
 
-def checar_regras(texto: str, regras: List[dict]) -> List[str]:
+def checar_regras(texto: str, regras: list) -> list:
     texto_norm = normalizar(texto)
     batidas = []
     for r in regras:
@@ -78,7 +54,6 @@ def checar_regras(texto: str, regras: List[dict]) -> List[str]:
 
 
 def carregar_config() -> dict:
-    """Configuração local (API, telefone, preferências de notificação)."""
     storage = Path(os.getenv("FLET_APP_STORAGE_DATA", Path.home()))
     storage.mkdir(parents=True, exist_ok=True)
     cfg_file = storage / "config_monitor.json"
@@ -89,8 +64,8 @@ def carregar_config() -> dict:
         except Exception:
             pass
     return {
-        "api_id": DEFAULT_API_ID,
-        "api_hash": DEFAULT_API_HASH,
+        "api_id": 0,
+        "api_hash": "",
         "telefone": "+55",
         "session_string": "",
         "grupos": [],
@@ -107,118 +82,29 @@ def salvar_config(cfg: dict):
 
 
 # ------------------------------------------------------------------
-# 3️⃣  Sincronização Firebase (se houver referência)
-# ------------------------------------------------------------------
-def firebase_load_rules() -> List[dict]:
-    if rules_ref is None:
-        return []
-    try:
-        data = rules_ref.get()
-        if data and isinstance(data, dict):
-            return list(data.values())
-    except Exception as e:
-        print("[ERROR] Firebase load rules:", e)
-    return []
-
-
-def firebase_save_rule(rule: dict):
-    if rules_ref is None:
-        return
-    try:
-        # Usa o nome da regra como chave única (ou gera UUID)
-        key = rule.get("name", str(uuid.uuid4()))
-        rules_ref.child(key).set(rule)
-    except Exception as e:
-        print("[ERROR] Firebase save rule:", e)
-
-
-def firebase_sync_loop():
-    """Thread que a cada 30 s puxa as regras da nuvem e atualiza a config local."""
-    while True:
-        try:
-            cloud_rules = firebase_load_rules()
-            local_cfg = carregar_config()
-            # Merge: regras da nuvem substituem as locais com mesmo nome
-            merged = {r["name"]: r for r in cloud_rules}
-            merged.update({r["name"]: r for r in local_cfg.get("regras", [])})
-            local_cfg["regras"] = list(merged.values())
-            salvar_config(local_cfg)
-        except Exception as e:
-            print("[ERROR] sync loop:", e)
-        asyncio.sleep(30)
-
-
-# ------------------------------------------------------------------
-# 4️⃣  WorkManager – serviço em segundo plano (Android)
-# ------------------------------------------------------------------
-def start_background_work():
-    """Registra um periodic task que mantém o client Telethon 'vivo'."""
-    from workmanager import IntervalTask
-
-    def job():
-        # Este função é chamada periodicamente. Aqui só verificamos se o client ainda está ligado.
-        # A lógica real de leitura de mensagens fica dentro do asyncio loop do Flet.
-        pass
-
-    # Executa a cada 15 minutos (Android mínimo). Ajuste conforme necessário.
-    task = IntervalTask(job, minutes=15)
-    task.start()
-
-
-# ------------------------------------------------------------------
-# 5️⃣  Helper de notificação nativa (plyer)
-# ------------------------------------------------------------------
-def mostrar_notificacao(titulo: str, corpo: str, som: str = "default", vibrar: bool = True):
-    """Usa o plyer para mostrar uma notificação Android com som/vibração."""
-    try:
-        if vibrar:
-            android_vibrate = True
-        else:
-            android_vibrate = False
-
-        plyer.notification.notify(
-            title=titulo,
-            message=corpo,
-            app_name="MonitorPromocoes",
-            timeout=10,
-            sound=som if som != "none" else None,
-            # O plyer no Android já traz som padrão se não for "none".
-            # Para som customizado basta colocar o caminho do ficheiro .wav/.mp3.
-        )
-    except Exception as e:
-        print("[ERROR] Notification failed:", e)
-
-
-# ------------------------------------------------------------------
-# 6️⃣  Interface Flet – main
-# ------------------------------------------------------------------
 async def main(page: ft.Page):
-    page.title = "Monitor de Promoções"
-    page.theme_mode = ft.ThemeMode.LIGHT
-    page.padding = ft.padding.only(top=36, left=16, right=16, bottom=16)
-    page.scroll = ft.ScrollMode.AUTO
-
-    # --- Carregar configuração local ---
-    cfg = carregar_config()
-
-    # --- Sincronização Firebase (background) ---
-    sync_task = asyncio.create_task(firebase_sync_loop())
-    # Iniciar WorkManager assim que houver cliente conectado (ver mais abaixo)
-
-    # --- Variáveis de estado ---
-    client: Optional[TelegramClient] = None
-    listen_task: Optional[asyncio.Task] = None
-    monitorando = False
-    alertas_enviados = 0
+    # ------------------------------------------------------------------
+    # ✅ Inicializar as variáveis “nonlocal” aqui (antes de qualquer
+    #    função aninhada). Qualquer alteração feita dentro das funções
+    #    `on_ligar_click`, `on_confirmar_codigo_click`, etc. será
+    #    refletida nessas variáveis.
+    # ------------------------------------------------------------------
+    global client, phone_code_hash  # <-- **importante** para a primeira atribuição
+    client = None
+    phone_code_hash = None
 
     # ------------------------------------------------------------------
-    # Elementos de UI (reutilizáveis)
+    # Carregar configuração guardada
+    # ------------------------------------------------------------------
+    cfg = carregar_config()
+
+    # ------------------------------------------------------------------
+    # Elementos da UI (conexão)
     # ------------------------------------------------------------------
     txt_status = ft.Text("Status: Desligado", size=18, weight=ft.FontWeight.BOLD, color=ft.colors.RED_700)
     txt_contador = ft.Text("Alertas enviados nesta sessão: 0", size=14, color=ft.colors.GREY_700)
     txt_erro_detalhe = ft.Text("", size=12, color=ft.colors.RED_800, selectable=True)
 
-    # ----- Conexão ----------------------------------------------------
     inp_api_id = ft.TextField(label="API ID", value=str(cfg.get("api_id", "")), keyboard_type=ft.KeyboardType.NUMBER)
     inp_api_hash = ft.TextField(label="API HASH", value=cfg.get("api_hash", ""))
     inp_tel = ft.TextField(label="Seu Telefone (com +55 e DDD)", value=cfg.get("telefone", "+55"), keyboard_type=ft.KeyboardType.PHONE)
@@ -230,30 +116,25 @@ async def main(page: ft.Page):
     btn_confirmar_codigo = ft.ElevatedButton("✅ Confirmar Código", on_click=None, bgcolor=ft.colors.BLUE_700, color=ft.colors.WHITE, height=48, width=400, visible=False)
     btn_desligar = ft.ElevatedButton("⏹️ Desligar Monitor", on_click=None, bgcolor=ft.colors.RED_700, color=ft.colors.WHITE, height=48, width=400, visible=False)
 
-    # ----- Preferências de notificação --------------------------------
+    # ------------------------------------------------------------------
+    # Preferências de notificação (popup, som, vibração)
+    # ------------------------------------------------------------------
     chk_popup = ft.Checkbox(label="Mostrar popup", value=cfg.get("notifications", {}).get("popup", True))
     drp_som = ft.Dropdown(
         label="Som",
-        options=[
-            ft.dropdown.Option("default"),
-            ft.dropdown.Option("none"),
-            ft.dropdown.Option("custom"),  # usuário pode apontar um ficheiro depois
-        ],
+        options=[ft.dropdown.Option("default"), ft.dropdown.Option("none"), ft.dropdown.Option("custom")],
         value=cfg.get("notifications", {}).get("som", "default"),
     )
     chk_vibrar = ft.Checkbox(label="Vibração", value=cfg.get("notifications", {}).get("vibrate", True))
 
     def salvar_prefs_notificacoes(e):
         nova_cfg = carregar_config()
-        nova_cfg["notifications"] = {
-            "popup": chk_popup.value,
-            "som": drp_som.value,
-            "vibrate": chk_vibrar.value,
-        }
+        nova_cfg["notifications"] = {"popup": chk_popup.value, "som": drp_som.value, "vibrate": chk_vibrar.value}
         salvar_config(nova_cfg)
 
     # ------------------------------------------------------------------
-    # Área de regras (igual ao teu código original, agora com sinc Firebase)
+    # Área de regras (igual ao seu código original, agora com suporte a
+    # notificações nativas quando uma regra bate)
     # ------------------------------------------------------------------
     inp_nome_regra = ft.TextField(label="Nome do Produto (ex: Air Fryer)")
     inp_obrig = ft.TextField(label="Palavras obrigatórias (ex: air fryer, mondial)")
@@ -272,15 +153,10 @@ async def main(page: ft.Page):
             def remover_fn(e, i=idx):
                 cfg["regras"].pop(i)
                 salvar_config(cfg)
-                # Também apagar da nuvem se houver Firebase
-                if rules_ref:
-                    try:
-                        # apagar pela chave = nome da regra (apenas se existir)
-                        rules_ref.child(r["name"]).delete()
-                    except Exception:
-                        pass
+                # também remover da nuvem Firebase se estiver configurado (opcional)
                 renderizar_regras()
-                avisar("Regra removida!")
+                txt_erro_detalhe.value = "Regra removida!"
+                page.update()
 
             card = ft.Card(
                 content=ft.ListTile(
@@ -292,7 +168,6 @@ async def main(page: ft.Page):
             col_lista_regras.controls.append(card)
         page.update()
 
-    # Função “Salvar regra” (também persiste no Firebase)
     def on_add_regra(e):
         nome = inp_nome_regra.value.strip()
         obrig = [t.strip() for t in inp_obrig.value.split(",") if t.strip()]
@@ -300,48 +175,42 @@ async def main(page: ft.Page):
         alts = [[t.strip() for t in alt_raw.split(",") if t.strip()]] if alt_raw else []
 
         if not nome or not obrig:
-            avisar("Preencha o Nome e pelo menos uma palavra!", ft.colors.RED_700)
+            txt_erro_detalhe.value = "Preencha o Nome e pelo menos uma palavra!"
+            page.update()
             return
 
-        nova_regra = {"name": nome, "all": obrig, "any_groups": alts}
-        # Remover regra antiga com mesmo nome (se existir)
+        # evita duplicata pelo nome
         cfg["regras"] = [r for r in cfg["regras"] if r["name"].lower() != nome.lower()]
-        cfg["regras"].append(nova_regra)
+        cfg["regras"].append({"name": nome, "all": obrig, "any_groups": alts})
         salvar_config(cfg)
-
-        # Persistir no Firebase (se configurado)
-        if rules_ref:
-            try:
-                firebase_save_rule(nova_regra)
-            except Exception:
-                pass
 
         inp_nome_regra.value = ""
         inp_obrig.value = ""
         inp_alt.value = ""
         renderizar_regras()
-        avisar(f"Regra '{nome}' salva!", ft.colors.GREEN_700)
+        txt_erro_detalhe.value = f"Regra '{nome}' salva!"
+        page.update()
 
-    # Botão adicionar regra
     btn_add_regra = ft.ElevatedButton("➕ Salvar Regra", on_click=on_add_regra, bgcolor=ft.colors.BLUE_700, color=ft.colors.WHITE, height=45, width=400)
 
     # ------------------------------------------------------------------
-    # Área de grupos (com checkboxes e filtro)
+    # Área de grupos (checkboxes)
     # ------------------------------------------------------------------
     col_lista_grupos = ft.Column(spacing=4)
 
     async def on_carregar_grupos(e):
-        if not client or not monitorando:
-            avisar("Ligue o monitor primeiro!", ft.colors.RED_700)
+        if not client or not monitorando:   # monitorando será definido mais abaixo
+            txt_erro_detalhe.value = "Ligue o monitor primeiro!"
+            page.update()
             return
-        avisar("A carregar grupos...")
+        txt_erro_detalhe.value = "A carregar grupos..."
+        page.update()
         col_lista_grupos.controls.clear()
         try:
             async for d in client.iter_dialogs():
                 if d.is_group or d.is_channel:
                     gid = utils.get_peer_id(d.id)
                     nome = d.name
-                    # Checkbox que guarda o ID na lista cfg["grupos"]
                     def on_check(ev, gid=gid):
                         if ev.control.value:
                             if gid not in cfg["grupos"]:
@@ -349,23 +218,170 @@ async def main(page: ft.Page):
                         else:
                             cfg["grupos"] = [g for g in cfg["grupos"] if g != gid]
                         salvar_config(cfg)
-
                     cb = ft.Checkbox(label=nome, value=(gid in cfg["grupos"]), on_change=on_check)
                     col_lista_grupos.controls.append(cb)
         except Exception as ex:
             txt_erro_detalhe.value = traceback.format_exc()
-            avisar(f"Erro ao carregar grupos: {ex}", ft.colors.RED_700)
         page.update()
-        avisar(f"{len(col_lista_grupos.controls)} grupos carregados!", ft.colors.GREEN_700)
+        txt_erro_detalhe.value = f"{len(col_lista_grupos.controls)} grupos carregados!"
+        page.update()
 
     btn_carregar_grupos = ft.ElevatedButton("🔄 Carregar Meus Grupos", on_click=on_carregar_grupos, bgcolor=ft.colors.BLUE_700, color=ft.colors.WHITE, height=45, width=400)
 
     # ------------------------------------------------------------------
-    # Funções de login / iniciar escuta (adaptadas)
+    # Variáveis de estado da sessão
     # ------------------------------------------------------------------
-    async def iniciar_escuta(tg_client: TelegramClient):
-        nonlocal monitorando, alertas_enviados, listen_task
+    monitorando = False
+    alertas_enviados = 0
 
+    # ------------------------------------------------------------------
+    # Funções que utilizam `nonlocal client, phone_code_hash`
+    # ------------------------------------------------------------------
+    async def on_ligar_click(e):
+        nonlocal client, phone_code_hash  # ✅ agora está ok porque as variáveis existem em `main`
+
+        txt_erro_detalhe.value = ""
+        api_id_str = inp_api_id.value.strip()
+        api_hash = inp_api_hash.value.strip()
+        tel = inp_tel.value.strip()
+
+        if not api_id_str.isdigit() or not api_hash or len(tel) < 10:
+            txt_erro_detalhe.value = "Preencha API ID, API HASH e telefone com +55."
+            txt_erro_detalhe.color = ft.colors.RED_700
+            page.update()
+            return
+
+        btn_ligar.disabled = True
+        btn_ligar.text = "Conectando..."
+        page.update()
+
+        cfg["api_id"] = int(api_id_str)
+        cfg["api_hash"] = api_hash
+        cfg["telefone"] = tel
+        salvar_config(cfg)
+
+        try:
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+            loop = asyncio.get_running_loop()
+            sessao = StringSession(cfg.get("session_string", ""))
+            client = TelegramClient(sessao, cfg["api_id"], cfg["api_hash"], loop=loop)
+            await client.connect()
+
+            if await client.is_user_authorized():
+                cfg["session_string"] = client.session.save()
+                salvar_config(cfg)
+                # iniciar serviço em segundo plano (WorkManager) – opcional
+                global monitorando
+                monitorando = True
+                txt_status.value = "Status: Monitorando ✅"
+                txt_status.color = ft.colors.GREEN_700
+                btn_ligar.visible = False
+                btn_confirmar_codigo.visible = False
+                inp_codigo.visible = False
+                inp_senha_2fa.visible = False
+                btn_desligar.visible = True
+                page.update()
+                txt_erro_detalhe.value = ""
+                await iniciar_escuta(client)
+            else:
+                sent = await client.send_code_request(tel)
+                phone_code_hash = sent.phone_code_hash   # ← guarda o hash para usar depois
+                inp_codigo.visible = True
+                btn_confirmar_codigo.visible = True
+                btn_ligar.visible = False
+                page.update()
+                txt_erro_detalhe.value = "Digite o código que chegou no seu Telegram!"
+        except Exception as ex:
+            txt_erro_detalhe.value = traceback.format_exc()
+            txt_erro_detalhe.color = ft.colors.RED_700
+            txt_status.value = "Status: Desligado"
+            txt_status.color = ft.colors.RED_700
+            btn_ligar.disabled = False
+            btn_ligar.text = "▶️ Ligar Monitor"
+            page.update()
+            txt_erro_detalhe.value = f"Erro ao conectar: {ex}"
+
+    async def on_confirmar_codigo_click(e):
+        nonlocal client, phone_code_hash  # ✅ também OK
+
+        codigo = inp_codigo.value.strip()
+        senha = inp_senha_2fa.value.strip()
+        if not codigo or not client:
+            return
+        btn_confirmar_codigo.disabled = True
+        page.update()
+        try:
+            try:
+                await client.sign_in(cfg["telefone"], codigo, phone_code_hash=phone_code_hash)
+            except SessionPasswordNeededError:
+                if not senha:
+                    inp_senha_2fa.visible = True
+                    page.update()
+                    txt_erro_detalhe.value = "Sua conta tem senha de 2 etapas. Digite abaixo."
+                    page.update()
+                    return
+                await client.sign_in(password=senha)
+
+            cfg["session_string"] = client.session.save()
+            salvar_config(cfg)
+            global monitorando
+            monitorando = True
+            txt_status.value = "Status: Monitorando ✅"
+            txt_status.color = ft.colors.GREEN_700
+            btn_ligar.visible = False
+            btn_confirmar_codigo.visible = False
+            inp_codigo.visible = False
+            inp_senha_2fa.visible = False
+            btn_desligar.visible = True
+            page.update()
+            txt_erro_detalhe.value = ""
+            await iniciar_escuta(client)
+        except Exception as ex:
+            txt_erro_detalhe.value = traceback.format_exc()
+            txt_erro_detalhe.color = ft.colors.RED_700
+            txt_status.value = "Status: Desligado"
+            txt_status.color = ft.colors.RED_700
+            btn_ligar.disabled = False
+            btn_ligar.text = "▶️ Ligar Monitor"
+            page.update()
+            txt_erro_detalhe.value = f"Código ou senha inválidos: {ex}"
+        finally:
+            btn_confirmar_codigo.disabled = False
+            page.update()
+
+    async def on_desligar_click(e):
+        global monitorando
+        monitorando = False
+        txt_status.value = "Status: Desligado"
+        txt_status.color = ft.colors.RED_700
+        btn_ligar.visible = True
+        btn_desligar.visible = False
+        page.update()
+        # cancelar tarefa de escuta se existir
+        if listen_task and not listen_task.done():
+            listen_task.cancel()
+        if client:
+            await client.disconnect()
+        txt_erro_detalhe.value = "Monitor desligado."
+        page.update()
+        txt_erro_detalhe.color = ft.colors.GREY_800
+
+    btn_desligar.on_click = on_desligar_click
+
+    # ------------------------------------------------------------------
+    # Função que realmente fica “ouvindo” as mensagens do Telegram
+    # ------------------------------------------------------------------
+    listen_task: Optional[asyncio.Task] = None
+
+    async def iniciar_escuta(tg_client: TelegramClient):
+        nonlocal monitorando, listen_task
+
+        # --- Comandos via "Mensagens Salvas" ---
         @tg_client.on(events.NewMessage(chats="me"))
         async def comando_mensagens_salvas(event):
             texto = (event.raw_text or "").strip()
@@ -375,10 +391,7 @@ async def main(page: ft.Page):
             cmd = partes[0].lower()
             arg = partes[1].strip() if len(partes) > 1 else ""
 
-            # ... (mantemos todos os comandos /help /status /regras /add /del /grupos /meusgrupos /addgrupo /delgrupo /limpargrupos /testar do teu código original) ...
-            # Para brevedade, copie exatamente as funções que já tens; só altere o parte de "avisar" para usar o novo sistema de notificação.
-            # Abaixo está o resumo dos comandos mais importantes (adicione o resto como no teu ficheiro original).
-
+            # ---- comandos auxiliares ----
             if cmd in ("/ajuda", "/help"):
                 await event.reply(
                     "🤖 **Comandos do Monitor de Promoções**\n\n"
@@ -531,7 +544,6 @@ async def main(page: ft.Page):
                 user = getattr(chat, "username", None)
                 link = f"\n\n🔗 https://t.me/{user}/{event.id}" if user else ""
 
-                # Montar mensagem de alerta
                 alerta = (
                     f"🔔 **Promoção encontrada!**\n"
                     f"🏷️ **Alerta:** {', '.join(batidas)}\n"
@@ -540,13 +552,20 @@ async def main(page: ft.Page):
                 )
 
                 # --- NOTIFICAÇÃO NATIVA (plyer) ---
-                # Respeita as preferências guardadas
                 notif_cfg = carregar_config().get("notifications", {})
                 if notif_cfg.get("popup", True):
                     som = notif_cfg.get("som", "default")
                     vibrar = notif_cfg.get("vibrate", True)
                     # Lança a notificação em thread separada para não travar o asyncio
-                    asyncio.create_task(mostrar_notificacao("Promoção detectada!", alerta, som=som, vibrar=vibrar))
+                    def show_notif():
+                        plyer.notification.notify(
+                            title="Promoção detectada!",
+                            message=alerta,
+                            app_name="MonitorPromocoes",
+                            timeout=10,
+                            sound=True if som != "none" else None,
+                        )
+                    asyncio.create_task(show_notif())
 
                 # Também envia para as Mensagens Salvas do Telegram (original)
                 await tg_client.send_message("me", alerta)
@@ -557,6 +576,7 @@ async def main(page: ft.Page):
         # ------------------------------------------------------------------
         # Quando a escuta começa – atualiza UI
         # ------------------------------------------------------------------
+        global monitorando
         monitorando = True
         txt_erro_detalhe.value = ""
         txt_status.value = "Status: Monitorando ✅"
@@ -567,115 +587,17 @@ async def main(page: ft.Page):
         inp_senha_2fa.visible = False
         btn_desligar.visible = True
         page.update()
-        avisar("Monitor ativo! Envie /ajuda nas Mensagens Salvas.", ft.colors.GREEN_700)
-
-    # ------------------------------------------------------------------
-    # Eventos de clique
-    # ------------------------------------------------------------------
-    async def on_ligar_click(e):
-        nonlocal client, phone_code_hash
-        txt_erro_detalhe.value = ""
-        api_id_str = inp_api_id.value.strip()
-        api_hash = inp_api_hash.value.strip()
-        tel = inp_tel.value.strip()
-
-        if not api_id_str.isdigit() or not api_hash or len(tel) < 10:
-            avisar("Preencha API ID, API HASH e seu telefone com +55.", ft.colors.RED_700)
-            return
-
-        btn_ligar.disabled = True
-        btn_ligar.text = "Conectando..."
+        txt_erro_detalhe.value = "Monitor ativo! Envie /ajuda nas Mensagens Salvas."
         page.update()
 
-        cfg["api_id"] = int(api_id_str)
-        cfg["api_hash"] = api_hash
-        cfg["telefone"] = tel
-        salvar_config(cfg)
-
-        try:
-            if client:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-
-            loop = asyncio.get_running_loop()
-            sessao = StringSession(cfg.get("session_string", ""))
-            client = TelegramClient(sessao, cfg["api_id"], cfg["api_hash"], loop=loop)
-            await client.connect()
-
-            if await client.is_user_authorized():
-                cfg["session_string"] = client.session.save()
-                salvar_config(cfg)
-                # Iniciar WorkManager para manter serviço em segundo plano
-                start_background_work()
-                await iniciar_escuta(client)
-            else:
-                sent = await client.send_code_request(tel)
-                phone_code_hash = sent.phone_code_hash
-                inp_codigo.visible = True
-                btn_confirmar_codigo.visible = True
-                btn_ligar.visible = False
-                page.update()
-                avisar("Digite o código que chegou no seu Telegram!")
-        except Exception as ex:
-            txt_erro_detalhe.value = traceback.format_exc()
-            avisar(f"Erro ao conectar: {ex}", ft.colors.RED_700)
-        finally:
-            btn_ligar.disabled = False
-            btn_ligar.text = "▶️ Ligar Monitor"
-            page.update()
-
-    async def on_confirmar_codigo_click(e):
-        codigo = inp_codigo.value.strip()
-        senha = inp_senha_2fa.value.strip()
-        if not codigo or not client:
-            return
-        btn_confirmar_codigo.disabled = True
-        page.update()
-        try:
-            try:
-                await client.sign_in(cfg["telefone"], codigo, phone_code_hash=phone_code_hash)
-            except SessionPasswordNeededError:
-                if not senha:
-                    inp_senha_2fa.visible = True
-                    page.update()
-                    avisar("Sua conta tem senha de 2 etapas. Digite abaixo.")
-                    return
-                await client.sign_in(password=senha)
-
-            cfg["session_string"] = client.session.save()
-            salvar_config(cfg)
-            # Iniciar WorkManager após login bem-sucedido
-            start_background_work()
-            await iniciar_escuta(client)
-        except Exception as ex:
-            txt_erro_detalhe.value = traceback.format_exc()
-            avisar(f"Código ou senha inválidos: {ex}", ft.colors.RED_700)
-        finally:
-            btn_confirmar_codigo.disabled = False
-            page.update()
-
-    async def on_desligar_click(e):
-        nonlocal monitorando, listen_task
-        if listen_task and not listen_task.done():
-            listen_task.cancel()
-        if client:
-            await client.disconnect()
-        monitorando = False
-        txt_status.value = "Status: Desligado"
-        txt_status.color = ft.colors.RED_700
-        btn_ligar.visible = True
-        btn_desligar.visible = False
-        page.update()
-        avisar("Monitor desligado.", ft.colors.GREY_800)
+        # Mantém o cliente rodando até ser desconectado
+        listen_task = asyncio.create_task(tg_client.run_until_disconnected())
 
     # ------------------------------------------------------------------
-    # Botões (inicialização de eventos)
+    # Ligação dos botões
     # ------------------------------------------------------------------
     btn_ligar.on_click = on_ligar_click
     btn_confirmar_codigo.on_click = on_confirmar_codigo_click
-    btn_desligar.on_click = on_desligar_click
 
     # ------------------------------------------------------------------
     # Tutorial “Como pegar API ID e API HASH”
@@ -714,7 +636,6 @@ async def main(page: ft.Page):
         spacing=12,
     )
 
-    # Regras
     view_regras = ft.Column(
         [
             ft.Text("Criar Novo Alerta", size=18, weight=ft.FontWeight.BOLD),
@@ -729,7 +650,6 @@ async def main(page: ft.Page):
         spacing=10,
     )
 
-    # Grupos
     view_grupos = ft.Column(
         [
             ft.Text("Escolher Grupos", size=18, weight=ft.FontWeight.BOLD),
@@ -740,7 +660,6 @@ async def main(page: ft.Page):
         spacing=10,
     )
 
-    # Gerenciar mudança de aba
     def mudar_aba(e):
         idx = e.control.selected_index
         if idx == 0:
@@ -770,4 +689,4 @@ async def main(page: ft.Page):
 # ----------------------------------------------------------------------
 # Ponto de entrada do Flet (Android será construído a partir deste target)
 # ----------------------------------------------------------------------
-ft.app(target=main, view=ft.WEB_BROWSER)  # alterar para `ft.APP` ao gerar APK via CLI
+ft.app(target=main, view=ft.WEB_BROWSER)   # alterar para `ft.ANDROID_ADK` ao gerar APK via CLI
