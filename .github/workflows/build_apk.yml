@@ -36,6 +36,10 @@ jobs:
       - name: Accept Android Licenses
         run: yes | flutter doctor --android-licenses || true
 
+      - name: Install Python dependencies
+        run: |
+          pip install plyer workmanager firebase
+
       - name: Gerar wheel do pyaes (só tem sdist no PyPI)
         run: |
           pip install wheel setuptools
@@ -55,7 +59,7 @@ jobs:
           find . -maxdepth 3 -name "main.py" -exec cp {} ./main.py \; 2>/dev/null || true
           pip install flet==0.25.2
           printf "flet==0.25.2\ntelethon\n" > requirements.txt
-          flet build apk --project "MonitorPromocoes" --org "com.arthur.monitor" --verbose
+          flet build apk --project "MonitorPromocoes" --org "com.usuario.monitorpromocoes" --verbose
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
