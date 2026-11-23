@@ -36,9 +36,10 @@ jobs:
       - name: Accept Android Licenses
         run: yes | flutter doctor --android-licenses || true
 
+      # --- NOVO PASSO: instalar as bibliotecas Python necessárias ---
       - name: Install Python dependencies
         run: |
-          pip install plyer workmanager firebase
+          pip install plyer firebase-admin
 
       - name: Gerar wheel do pyaes (só tem sdist no PyPI)
         run: |
