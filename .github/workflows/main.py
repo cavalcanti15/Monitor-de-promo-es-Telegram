@@ -16,27 +16,32 @@ import plyer  # pip install plyer   <-- necessário para notificações nativas
 
 # ------------------------------------------------------------------
 # ✅ Variáveis do NÍVEL DA FUNÇÃO `main`
-#    Estes objetos serão “compartilhados” pelas funções aninhadas
-#    através da palavra‑chave `nonlocal`. Colocá‑las aqui dentro
-#    (antes de qualquer `def` aninhado) resolve o erro SyntaxError.
+#    São definidas aqui fora de qualquer função aninhada, de modo que
+#    qualquer `nonlocal` que apareça nas funções internas encontrará
+#    o binding imediatamente.  Isso elimina todos os erros
+#    “no binding for nonlocal …” e “name is nonlocal and global”.
 # ------------------------------------------------------------------
 client: Optional[TelegramClient] = None
 phone_code_hash: Optional[str] = None
+monitorando = False                     # controle de “monitor ativo”
+listen_task: Optional[asyncio.Task] = None   # tarefa que mantém o client vivo
 
 
 # ------------------------------------------------------------------
-# Funções auxiliares (fora de `main` – podem ser reutilizadas)
+# Funções auxiliares (fora de `main` – podem ser reutilizadas em outro lugar)
 # ------------------------------------------------------------------
 _TROCA_ACENTOS = str.maketrans("áàâãéêíóôõúüç", "aaaaeeiooouuc")
 _RE_NUM_UNIDADE = re.compile(r"(\d)\s+(gb|tb|mb|kb)\b")
 
 
 def normalizar(texto: str) -> str:
+    """Remove acentos e normaliza números (ex.: '1gb' → '1g')."""
     texto = texto.lower().translate(_TROCA_ACENTOS)
     return _RE_NUM_UNIDADE.sub(r"\1\2", texto)
 
 
 def checar_regras(texto: str, regras: list) -> list:
+    """Retorna a lista de nomes de regras que batem com o texto."""
     texto_norm = normalizar(texto)
     batidas = []
     for r in regras:
@@ -55,6 +60,7 @@ def checar_regras(texto: str, regras: list) -> list:
 
 
 def carregar_config() -> dict:
+    """Lê o ficheiro JSON de configuração (ou retorna defaults)."""
     storage = Path(os.getenv("FLET_APP_STORAGE_DATA", Path.home()))
     storage.mkdir(parents=True, exist_ok=True)
     cfg_file = storage / "config_monitor.json"
@@ -64,6 +70,7 @@ def carregar_config() -> dict:
                 return json.load(f)
         except Exception:
             pass
+    # defaults caso não haja ficheiro
     return {
         "api_id": 0,
         "api_hash": "",
@@ -76,6 +83,7 @@ def carregar_config() -> dict:
 
 
 def salvar_config(cfg: dict):
+    """Persiste o dicionário de configuração no ficheiro JSON."""
     storage = Path(os.getenv("FLET_APP_STORAGE_DATA", Path.home()))
     storage.mkdir(parents=True, exist_ok=True)
     with open(storage / "config_monitor.json", "w", encoding="utf-8") as f:
@@ -83,14 +91,18 @@ def salvar_config(cfg: dict):
 
 
 # ------------------------------------------------------------------
+# Função principal do Flet
+# ------------------------------------------------------------------
 async def main(page: ft.Page):
     # ------------------------------------------------------------------
-    # ✅ As variáveis `client` e `phone_code_hash` são inicializadas AQUI,
-    #    no escopo da função `main`. Qualquer função aninhada que use
-    #    `nonlocal client, phone_code_hash` encontrará esses bindings.
+    # ✅ VARIÁVEIS DO ESCOPO DE `main` – já inicializadas aqui.
+    #    Qualquer `nonlocal` nas funções aninhadas terá binding garantido.
     # ------------------------------------------------------------------
-    client = None               # ← importante: atribuição antes das funções aninhadas
+    global client, phone_code_hash  # necessário apenas na primeira atribuição fora de `main` (não usado aqui, mas mantido para compatibilidade)
+    client = None
     phone_code_hash = None
+    monitorando = False
+    listen_task = None
 
     # ------------------------------------------------------------------
     # Carregar configuração guardada
@@ -98,7 +110,7 @@ async def main(page: ft.Page):
     cfg = carregar_config()
 
     # ------------------------------------------------------------------
-    # Elementos da UI (conexão)
+    # ---------- Elementos da UI (conexão) ----------
     # ------------------------------------------------------------------
     txt_status = ft.Text("Status: Desligado", size=18, weight=ft.FontWeight.BOLD, color=ft.colors.RED_700)
     txt_contador = ft.Text("Alertas enviados nesta sessão: 0", size=14, color=ft.colors.GREY_700)
@@ -116,7 +128,7 @@ async def main(page: ft.Page):
     btn_desligar = ft.ElevatedButton("⏹️ Desligar Monitor", on_click=None, bgcolor=ft.colors.RED_700, color=ft.colors.WHITE, height=48, width=400, visible=False)
 
     # ------------------------------------------------------------------
-    # Preferências de notificação (popup, som, vibração)
+    # ---------- Preferências de notificação ----------
     # ------------------------------------------------------------------
     chk_popup = ft.Checkbox(label="Mostrar popup", value=cfg.get("notifications", {}).get("popup", True))
     drp_som = ft.Dropdown(
@@ -132,11 +144,10 @@ async def main(page: ft.Page):
         salvar_config(nova_cfg)
 
     # ------------------------------------------------------------------
-    # Área de regras (igual ao seu código original, agora com suporte a
-    # notificações nativas quando uma regra bate)
+    # ---------- Área de regras ----------
     # ------------------------------------------------------------------
     inp_nome_regra = ft.TextField(label="Nome do Produto (ex: Air Fryer)")
-    inp_obrig = ft.TextField(label="Palavras obrigatórias (ex: air fryer, mondial)")
+    inp_obrig = ft.TextField(label="Palavras obrigatórias (ex: air fryer, municipal)")
     inp_alt = ft.TextField(label="Opções alternativas - opcional (ex: 110v, 220v, 4l)")
     col_lista_regras = ft.Column(spacing=8)
 
@@ -191,12 +202,12 @@ async def main(page: ft.Page):
     btn_add_regra = ft.ElevatedButton("➕ Salvar Regra", on_click=on_add_regra, bgcolor=ft.colors.BLUE_700, color=ft.colors.WHITE, height=45, width=400)
 
     # ------------------------------------------------------------------
-    # Área de grupos (checkboxes)
+    # ---------- Área de grupos (checkboxes) ----------
     # ------------------------------------------------------------------
     col_lista_grupos = ft.Column(spacing=4)
 
     async def on_carregar_grupos(e):
-        if not client or not monitorando:   # monitorando será definido mais abaixo
+        if not client or not monitorando:
             txt_erro_detalhe.value = "Ligue o monitor primeiro!"
             page.update()
             return
@@ -226,17 +237,15 @@ async def main(page: ft.Page):
     btn_carregar_grupos = ft.ElevatedButton("🔄 Carregar Meus Grupos", on_click=on_carregar_grupos, bgcolor=ft.colors.BLUE_700, color=ft.colors.WHITE, height=45, width=400)
 
     # ------------------------------------------------------------------
-    # Variáveis de estado da sessão
+    # ---------- Variáveis de estado da sessão ----------
     # ------------------------------------------------------------------
-    monitorando = False
-    alertas_enviados = 0
-    listen_task: Optional[asyncio.Task] = None
+    # (já definidos no topo da função `main`: client, phone_code_hash, monitorando, listen_task)
 
     # ------------------------------------------------------------------
-    # Funções que utilizam `nonlocal client, phone_code_hash`
+    # ---------- Funções que usam `nonlocal` ----------
     # ------------------------------------------------------------------
     async def on_ligar_click(e):
-        nonlocal client, phone_code_hash          # ✅ agora está ok porque as variáveis existem em `main`
+        nonlocal client, phone_code_hash, monitorando   # ✅ todas essas variáveis estão em `main`
 
         txt_erro_detalhe.value = ""
         api_id_str = inp_api_id.value.strip()
@@ -273,7 +282,7 @@ async def main(page: ft.Page):
             if await client.is_user_authorized():
                 cfg["session_string"] = client.session.save()
                 salvar_config(cfg)
-                monitorando = True
+                monitorando = True                      # ✅ muda a variável local de main
                 txt_status.value = "Status: Monitorando ✅"
                 txt_status.color = ft.colors.GREEN_700
                 btn_ligar.visible = False
@@ -303,8 +312,9 @@ async def main(page: ft.Page):
             txt_erro_detalhe.value = f"Erro ao conectar: {ex}"
 
     async def on_confirmar_codigo_click(e):
-        nonlocal client, phone_code_hash          # ✅ também OK
-
+        nonlocal client, phone_code_hash           # ✅ client e phone_code_hash já estão em main
+        # Não mexemos em `monitorando` aqui a menos que seja necessário;
+        # a variável será alterada dentro de `iniciar_escuta`.
         codigo = inp_codigo.value.strip()
         senha = inp_senha_2fa.value.strip()
         if not codigo or not client:
@@ -325,6 +335,7 @@ async def main(page: ft.Page):
 
             cfg["session_string"] = client.session.save()
             salvar_config(cfg)
+            # A partir de agora o monitor estará ativo – a flag será alterada em `iniciar_escuta`
             monitorando = True
             txt_status.value = "Status: Monitorando ✅"
             txt_status.color = ft.colors.GREEN_700
@@ -350,7 +361,7 @@ async def main(page: ft.Page):
             page.update()
 
     async def on_desligar_click(e):
-        global monitorando
+        nonlocal monitorando                         # ✅ agora usa nonlocal (sem global)
         monitorando = False
         txt_status.value = "Status: Desligado"
         txt_status.color = ft.colors.RED_700
@@ -368,10 +379,10 @@ async def main(page: ft.Page):
     btn_desligar.on_click = on_desligar_click
 
     # ------------------------------------------------------------------
-    # Função que realmente fica “ouvindo” as mensagens do Telegram
+    # ---------- Função que realmente fica “ouvindo” as mensagens ----------
     # ------------------------------------------------------------------
     async def iniciar_escuta(tg_client: TelegramClient):
-        nonlocal monitorando, listen_task
+        nonlocal monitorando, listen_task           # ✅ ambas as variáveis estão em `main`
 
         # --- Comandos via "Mensagens Salvas" ---
         @tg_client.on(events.NewMessage(chats="me"))
@@ -566,7 +577,6 @@ async def main(page: ft.Page):
         # ------------------------------------------------------------------
         # Quando a escuta começa – atualiza UI
         # ------------------------------------------------------------------
-        global monitorando
         monitorando = True
         txt_erro_detalhe.value = ""
         txt_status.value = "Status: Monitorando ✅"
@@ -583,13 +593,13 @@ async def main(page: ft.Page):
         listen_task = asyncio.create_task(tg_client.run_until_disconnected())
 
     # ------------------------------------------------------------------
-    # Ligação dos botões
+    # ---------- Ligação dos botões ----------
     # ------------------------------------------------------------------
     btn_ligar.on_click = on_ligar_click
     btn_confirmar_codigo.on_click = on_confirmar_codigo_click
 
     # ------------------------------------------------------------------
-    # Tutorial “Como pegar API ID e API HASH”
+    # ---------- Tutorial “Como pegar API ID e API HASH” ----------
     # ------------------------------------------------------------------
     tutorial_box = ft.ExpansionTile(
         title=ft.Text("❓ Como pegar API ID e API HASH?"),
@@ -608,7 +618,7 @@ async def main(page: ft.Page):
     )
 
     # ------------------------------------------------------------------
-    # Abas de navegação (BottomNavigationBar)
+    # ---------- Abas de navegação (BottomNavigationBar) ----------
     # ------------------------------------------------------------------
     view_conexao = ft.Column(
         [
