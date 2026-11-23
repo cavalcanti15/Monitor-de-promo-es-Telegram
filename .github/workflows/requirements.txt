@@ -1,5 +1,4 @@
 telethon
 flet
 plyer
-workmanager
 firebase
