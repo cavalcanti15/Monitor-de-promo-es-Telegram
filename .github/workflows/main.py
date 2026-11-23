@@ -15,13 +15,14 @@ from telethon.errors import SessionPasswordNeededError
 import plyer  # pip install plyer   <-- necessário para notificações nativas
 
 # ------------------------------------------------------------------
-# ✅ VARIÁVEIS DO NÍVEL SUPERIOR DE `main`
+# ✅ Variáveis do NÍVEL DA FUNÇÃO `main`
 #    Estes objetos serão “compartilhados” pelas funções aninhadas
-#    através da palavra‑chave `nonlocal`. Colocá‑las aqui fora
-#    das funções aninhadas resolve o erro SyntaxError.
+#    através da palavra‑chave `nonlocal`. Colocá‑las aqui dentro
+#    (antes de qualquer `def` aninhado) resolve o erro SyntaxError.
 # ------------------------------------------------------------------
 client: Optional[TelegramClient] = None
 phone_code_hash: Optional[str] = None
+
 
 # ------------------------------------------------------------------
 # Funções auxiliares (fora de `main` – podem ser reutilizadas)
@@ -84,13 +85,11 @@ def salvar_config(cfg: dict):
 # ------------------------------------------------------------------
 async def main(page: ft.Page):
     # ------------------------------------------------------------------
-    # ✅ Inicializar as variáveis “nonlocal” aqui (antes de qualquer
-    #    função aninhada). Qualquer alteração feita dentro das funções
-    #    `on_ligar_click`, `on_confirmar_codigo_click`, etc. será
-    #    refletida nessas variáveis.
+    # ✅ As variáveis `client` e `phone_code_hash` são inicializadas AQUI,
+    #    no escopo da função `main`. Qualquer função aninhada que use
+    #    `nonlocal client, phone_code_hash` encontrará esses bindings.
     # ------------------------------------------------------------------
-    global client, phone_code_hash  # <-- **importante** para a primeira atribuição
-    client = None
+    client = None               # ← importante: atribuição antes das funções aninhadas
     phone_code_hash = None
 
     # ------------------------------------------------------------------
@@ -153,7 +152,6 @@ async def main(page: ft.Page):
             def remover_fn(e, i=idx):
                 cfg["regras"].pop(i)
                 salvar_config(cfg)
-                # também remover da nuvem Firebase se estiver configurado (opcional)
                 renderizar_regras()
                 txt_erro_detalhe.value = "Regra removida!"
                 page.update()
@@ -179,7 +177,6 @@ async def main(page: ft.Page):
             page.update()
             return
 
-        # evita duplicata pelo nome
         cfg["regras"] = [r for r in cfg["regras"] if r["name"].lower() != nome.lower()]
         cfg["regras"].append({"name": nome, "all": obrig, "any_groups": alts})
         salvar_config(cfg)
@@ -233,12 +230,13 @@ async def main(page: ft.Page):
     # ------------------------------------------------------------------
     monitorando = False
     alertas_enviados = 0
+    listen_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Funções que utilizam `nonlocal client, phone_code_hash`
     # ------------------------------------------------------------------
     async def on_ligar_click(e):
-        nonlocal client, phone_code_hash  # ✅ agora está ok porque as variáveis existem em `main`
+        nonlocal client, phone_code_hash          # ✅ agora está ok porque as variáveis existem em `main`
 
         txt_erro_detalhe.value = ""
         api_id_str = inp_api_id.value.strip()
@@ -275,8 +273,6 @@ async def main(page: ft.Page):
             if await client.is_user_authorized():
                 cfg["session_string"] = client.session.save()
                 salvar_config(cfg)
-                # iniciar serviço em segundo plano (WorkManager) – opcional
-                global monitorando
                 monitorando = True
                 txt_status.value = "Status: Monitorando ✅"
                 txt_status.color = ft.colors.GREEN_700
@@ -307,7 +303,7 @@ async def main(page: ft.Page):
             txt_erro_detalhe.value = f"Erro ao conectar: {ex}"
 
     async def on_confirmar_codigo_click(e):
-        nonlocal client, phone_code_hash  # ✅ também OK
+        nonlocal client, phone_code_hash          # ✅ também OK
 
         codigo = inp_codigo.value.strip()
         senha = inp_senha_2fa.value.strip()
@@ -329,7 +325,6 @@ async def main(page: ft.Page):
 
             cfg["session_string"] = client.session.save()
             salvar_config(cfg)
-            global monitorando
             monitorando = True
             txt_status.value = "Status: Monitorando ✅"
             txt_status.color = ft.colors.GREEN_700
@@ -362,7 +357,6 @@ async def main(page: ft.Page):
         btn_ligar.visible = True
         btn_desligar.visible = False
         page.update()
-        # cancelar tarefa de escuta se existir
         if listen_task and not listen_task.done():
             listen_task.cancel()
         if client:
@@ -376,8 +370,6 @@ async def main(page: ft.Page):
     # ------------------------------------------------------------------
     # Função que realmente fica “ouvindo” as mensagens do Telegram
     # ------------------------------------------------------------------
-    listen_task: Optional[asyncio.Task] = None
-
     async def iniciar_escuta(tg_client: TelegramClient):
         nonlocal monitorando, listen_task
 
@@ -529,7 +521,6 @@ async def main(page: ft.Page):
             nonlocal alertas_enviados
             if event.out or event.is_private:
                 return
-            # Aplicar filtro de grupos se houver
             if cfg["grupos"]:
                 peer_id = utils.get_peer_id(event.chat_id)
                 if peer_id not in cfg["grupos"] and event.chat_id not in cfg["grupos"]:
@@ -556,7 +547,6 @@ async def main(page: ft.Page):
                 if notif_cfg.get("popup", True):
                     som = notif_cfg.get("som", "default")
                     vibrar = notif_cfg.get("vibrate", True)
-                    # Lança a notificação em thread separada para não travar o asyncio
                     def show_notif():
                         plyer.notification.notify(
                             title="Promoção detectada!",
@@ -590,7 +580,6 @@ async def main(page: ft.Page):
         txt_erro_detalhe.value = "Monitor ativo! Envie /ajuda nas Mensagens Salvas."
         page.update()
 
-        # Mantém o cliente rodando até ser desconectado
         listen_task = asyncio.create_task(tg_client.run_until_disconnected())
 
     # ------------------------------------------------------------------
